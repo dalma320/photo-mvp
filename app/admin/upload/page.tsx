@@ -1,13 +1,9 @@
-import { Suspense } from 'react'
-import UploadClient from './UploadClient'
+// app/admin/upload/page.tsx
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
-export const dynamic = 'force-dynamic'
-export const revalidate = 0
+import UploadClient from "./UploadClient";
 
 export default function Page() {
-  return (
-    <Suspense fallback={<div style={{ padding: 40 }}>로딩 중...</div>}>
-      <UploadClient />
-    </Suspense>
-  )
+  return <UploadClient />;
 }

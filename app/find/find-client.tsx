@@ -5,49 +5,22 @@ import { useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ref, uploadBytes, getDownloadURL, listAll } from "firebase/storage";
 import { storage, db } from "../../lib/firebaseClient";
-import * as faceapi from "face-api.js";
-import { addDoc, collection, serverTimestamp } from "firebase/firestore";
+import { addDoc, collection, serverTimestamp, getDocs } from "firebase/firestore";
+import { embedFace } from "../../lib/faceServer";
 
-type PhotoItem = { path: string; url: string };
-type MatchItem = PhotoItem & { score: number };
+type PhotoDoc = { id: string; fullPath: string; downloadURL: string; embedding: number[] };
+type MatchItem = { id: string; path: string; url: string; score: number };
 
-function cosineSimilarity(a: Float32Array, b: Float32Array) {
-  let dot = 0;
-  let na = 0;
-  let nb = 0;
+function cosineSimilarity(a: number[], b: number[]) {
+  if (!a?.length || !b?.length || a.length !== b.length) return 0;
+  let dot = 0, na = 0, nb = 0;
   for (let i = 0; i < a.length; i++) {
     dot += a[i] * b[i];
     na += a[i] * a[i];
     nb += b[i] * b[i];
   }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-10);
-}
-
-async function urlToCanvasViaProxy(url: string, maxSize = 640) {
-  const proxied = `/api/img?u=${encodeURIComponent(url)}`;
-  const res = await fetch(proxied, { cache: "no-store" });
-  if (!res.ok) throw new Error(`proxy fetch failed: ${res.status}`);
-
-  const blob = await res.blob();
-  const bitmap = await createImageBitmap(blob);
-
-  const w = bitmap.width;
-  const h = bitmap.height;
-  const scale = Math.min(maxSize / w, maxSize / h, 1);
-  const tw = Math.round(w * scale);
-  const th = Math.round(h * scale);
-
-  const canvas = document.createElement("canvas");
-  canvas.width = tw;
-  canvas.height = th;
-
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("canvas context 생성 실패");
-
-  ctx.drawImage(bitmap, 0, 0, tw, th);
-  bitmap.close();
-
-  return canvas;
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom ? dot / denom : 0;
 }
 
 function makeUid() {
@@ -72,12 +45,10 @@ export default function FindClient() {
   const uidFromUrl = sp.get("uid") ?? "";
 
   const safeEventId = useMemo(() => eventId, [eventId]);
-
-  // ✅ uid는 URL에 없으면 내부에서 만들어서 계속 유지
   const [safeUid, setSafeUid] = useState<string>("");
 
-  // Data
-  const [eventPhotos, setEventPhotos] = useState<PhotoItem[]>([]);
+  // ✅ Firestore에서 읽어온 “임베딩 포함 행사 사진”
+  const [eventPhotos, setEventPhotos] = useState<PhotoDoc[]>([]);
   const [loadingEventPhotos, setLoadingEventPhotos] = useState(true);
   const [eventPhotosMsg, setEventPhotosMsg] = useState("");
 
@@ -90,14 +61,8 @@ export default function FindClient() {
   const [matchLoading, setMatchLoading] = useState(false);
   const [matchMessage, setMatchMessage] = useState("");
   const [matches, setMatches] = useState<MatchItem[]>([]);
-  const [threshold, setThreshold] = useState(0.88);
+  const [threshold, setThreshold] = useState(0.55); // face-server 임베딩은 보통 0.45~0.7 영역에서 튜닝
   const [showAdvanced, setShowAdvanced] = useState(false);
-
-  // 🔥 Matching quality / perf knobs
-  const [scanBatchSize] = useState(60); // 60장씩
-  const [scanMax] = useState(240); // 최대 240장까지 (원하면 올려)
-  const [progress, setProgress] = useState<{ done: number; total: number }>({ done: 0, total: 0 });
-  const abortRef = useRef(false);
 
   // Save
   const [savingKey, setSavingKey] = useState<string | null>(null);
@@ -107,11 +72,8 @@ export default function FindClient() {
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
 
-  // Refs
-  const modelsReadyRef = useRef(false);
   const autoRanRef = useRef(false);
 
-  // ✅ eventId 없으면 홈으로 안내
   if (!safeEventId) {
     return (
       <main style={{ minHeight: "100vh", background: "#000", color: "#fff", padding: 24 }}>
@@ -126,7 +88,7 @@ export default function FindClient() {
     );
   }
 
-  // ✅ uid 세팅 + URL에 심기 (사용자에게는 안 보이게 replace)
+  // ✅ uid 세팅 + URL에 심기
   useEffect(() => {
     const uid = uidFromUrl || makeUid();
     setSafeUid(uid);
@@ -139,45 +101,41 @@ export default function FindClient() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uidFromUrl, safeEventId]);
 
-  const ensureModels = async () => {
-    if (modelsReadyRef.current) return;
-    setMatchMessage("모델 로딩 중... (최초 1회)");
-    const base = "/models";
-    await faceapi.nets.tinyFaceDetector.loadFromUri(base);
-    await faceapi.nets.faceLandmark68TinyNet.loadFromUri(base);
-    await faceapi.nets.faceRecognitionNet.loadFromUri(base);
-    modelsReadyRef.current = true;
-  };
-
-  const loadEventPhotos = async () => {
+  // ✅ Firestore에서 임베딩 포함 행사 사진 로드
+  const loadEventPhotosFromFirestore = async () => {
     try {
       setLoadingEventPhotos(true);
-      setEventPhotosMsg("행사 사진 불러오는 중...");
+      setEventPhotosMsg("행사 사진(임베딩) 불러오는 중...");
       setEventPhotos([]);
 
-      const folderRef = ref(storage, `events/${safeEventId}/photos`);
-      const res = await listAll(folderRef);
-
-      // 최신부터
-      const sorted = [...res.items].sort((a, b) => b.name.localeCompare(a.name));
-
-      const urls = await Promise.all(
-        sorted.map(async (item) => {
-          const url = await getDownloadURL(item);
-          return { path: item.fullPath, url };
+      const snap = await getDocs(collection(db, "events", safeEventId, "photos"));
+      const docs: PhotoDoc[] = snap.docs
+        .map((d) => {
+          const v: any = d.data();
+          return {
+            id: d.id,
+            fullPath: v.fullPath,
+            downloadURL: v.downloadURL,
+            embedding: v.embedding,
+          };
         })
-      );
+        .filter((x) => Array.isArray(x.embedding) && typeof x.downloadURL === "string");
 
-      setEventPhotos(urls);
-      setEventPhotosMsg(urls.length ? `사진 ${urls.length}장 준비됨` : "행사 사진이 아직 없어요.");
+      setEventPhotos(docs);
+      setEventPhotosMsg(docs.length ? `임베딩된 사진 ${docs.length}장 준비됨` : "임베딩된 행사 사진이 아직 없어요. (운영자 업로드 필요)");
     } catch (e) {
       console.error(e);
       setEventPhotos([]);
-      setEventPhotosMsg("행사 사진을 불러오지 못했어요. (권한/경로 확인)");
+      setEventPhotosMsg("행사 사진(임베딩)을 불러오지 못했어요. (권한/경로 확인)");
     } finally {
       setLoadingEventPhotos(false);
     }
   };
+
+  useEffect(() => {
+    loadEventPhotosFromFirestore();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [safeEventId]);
 
   const loadSelfieUrlByUid = async (uid: string) => {
     const folderRef = ref(storage, `events/${safeEventId}/selfies`);
@@ -187,144 +145,43 @@ export default function FindClient() {
     return await getDownloadURL(found);
   };
 
-  useEffect(() => {
-    loadEventPhotos();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [safeEventId]);
-
-  const abortScan = () => {
-    abortRef.current = true;
-    setMatchMessage("중단했어요. 다시 시작하려면 셀카를 다시 올려줘!");
-    setMatchLoading(false);
-  };
-
-  const runMatching = async (uploadedSelfieUrl: string) => {
+  const runMatching = async (uploadedSelfieFile: File) => {
     if (!eventPhotos.length) {
-      setMatchMessage("행사 사진이 아직 없어요. 운영자 업로드를 확인해줘!");
+      setMatchMessage("임베딩된 행사 사진이 아직 없어요. 운영자 업로드를 먼저 해줘!");
       return;
     }
-
-    abortRef.current = false;
 
     try {
       setMatchLoading(true);
       setMatches([]);
       setSavingKey(null);
       setSavedKeys(new Set());
-      setProgress({ done: 0, total: Math.min(scanMax, eventPhotos.length) });
 
-      setMatchMessage("준비 중...");
-      await ensureModels();
+      setMatchMessage("셀카 임베딩 생성 중...");
+      const q = await embedFace(uploadedSelfieFile);
 
-      // 1) 셀카 descriptor
-      setMatchMessage("셀카 분석 중...");
-      const selfieCanvas = await urlToCanvasViaProxy(uploadedSelfieUrl, 640);
+      setMatchMessage("매칭 중...");
+      const scored = eventPhotos
+        .map((p) => ({
+          id: p.id,
+          path: p.fullPath,
+          url: p.downloadURL,
+          score: cosineSimilarity(q, p.embedding),
+        }))
+        .sort((a, b) => b.score - a.score);
 
-      const selfieDet = await faceapi
-        .detectSingleFace(selfieCanvas, new faceapi.TinyFaceDetectorOptions({ inputSize: 320 }))
-        .withFaceLandmarks(true)
-        .withFaceDescriptor();
+      const filtered = scored.filter((x) => x.score >= threshold).slice(0, 24);
+      const top = (filtered.length ? filtered : scored.slice(0, 24)).slice(0, 8);
 
-      if (!selfieDet) {
-        setMatchMessage("셀카에서 얼굴을 찾지 못했어요. 얼굴이 크게 나오게 다시 찍어줘!");
-        return;
-      }
-      const selfieDesc = selfieDet.descriptor;
-
-      // 2) 후보를 배치로 점진 탐색
-      const total = Math.min(scanMax, eventPhotos.length);
-      const pool = eventPhotos.slice(0, total);
-
-      const scoredAll: MatchItem[] = [];
-      const TOP_KEEP = 25; // 상위만 유지
-      const CONCURRENCY = 2; // 브라우저 안정
-
-      const scoreOne = async (p: PhotoItem): Promise<MatchItem | null> => {
-        if (abortRef.current) return null;
-
-        try {
-          const canvas = await urlToCanvasViaProxy(p.url, 640);
-
-          const detections = await faceapi
-            .detectAllFaces(canvas, new faceapi.TinyFaceDetectorOptions({ inputSize: 320 }))
-            .withFaceLandmarks(true)
-            .withFaceDescriptors();
-
-          if (!detections || detections.length === 0) return null;
-
-          let best = -1;
-          for (const d of detections) {
-            const s = cosineSimilarity(selfieDesc, d.descriptor);
-            if (s > best) best = s;
-          }
-
-          return { ...p, score: best };
-        } catch (e) {
-          console.warn("analyze failed:", p.path, e);
-          return null;
-        }
-      };
-
-      const keepTop = (arr: MatchItem[]) => {
-        arr.sort((a, b) => b.score - a.score);
-        if (arr.length > TOP_KEEP) arr.splice(TOP_KEEP);
-      };
-
-      for (let start = 0; start < pool.length; start += scanBatchSize) {
-        if (abortRef.current) break;
-
-        const end = Math.min(pool.length, start + scanBatchSize);
-        const batch = pool.slice(start, end);
-
-        setMatchMessage(`내 사진 찾는 중... (${start + 1}~${end}/${pool.length})`);
-
-        let i = 0;
-        while (i < batch.length) {
-          if (abortRef.current) break;
-
-          const chunk = batch.slice(i, i + CONCURRENCY);
-          const results = await Promise.all(chunk.map(scoreOne));
-
-          for (const r of results) {
-            if (r && r.score >= 0) scoredAll.push(r);
-          }
-
-          i += CONCURRENCY;
-          setProgress({ done: Math.min(pool.length, start + i), total: pool.length });
-        }
-
-        keepTop(scoredAll);
-
-        const filtered = scoredAll.filter((x) => x.score >= threshold).sort((a, b) => b.score - a.score);
-        const top = filtered.slice(0, 8);
-
-        if (top.length > 0) {
-          setMatches(top);
-          setMatchMessage(`찾았어! ${top.length}장 (기준선 ${threshold.toFixed(2)})`);
-          // 계속 돌면서 더 좋은 결과를 찾되, UI는 이미 보여줌
-        } else {
-          setMatches([]);
-          setMatchMessage(`아직 못 찾았어요… 계속 찾는 중 (기준선 ${threshold.toFixed(2)})`);
-        }
-      }
-
-      if (abortRef.current) return;
-
-      scoredAll.sort((a, b) => b.score - a.score);
-      const finalFiltered = scoredAll.filter((x) => x.score >= threshold);
-      const finalTop = finalFiltered.slice(0, 8);
-      setMatches(finalTop);
-
-      if (finalTop.length === 0) {
-        setMatchMessage(
-          `끝까지 찾았지만 결과가 없어요. 기준선을 낮추거나 셀카를 바꿔봐! (기준선 ${threshold.toFixed(2)})`
-        );
-      } else {
-        setMatchMessage(`완료! ${finalTop.length}장 (기준선 ${threshold.toFixed(2)})`);
-      }
+      setMatches(top);
+      setMatchMessage(
+        filtered.length
+          ? `찾았어! ${top.length}장 (기준선 ${threshold.toFixed(2)})`
+          : `기준선 이상은 없지만, 가장 비슷한 사진을 보여줄게 (기준선 ${threshold.toFixed(2)})`
+      );
     } catch (e) {
       console.error(e);
-      setMatchMessage("매칭에 실패했어요. 잠시 후 다시 시도해줘!");
+      setMatchMessage("매칭에 실패했어요. (콘솔 확인)");
     } finally {
       setMatchLoading(false);
     }
@@ -343,17 +200,18 @@ export default function FindClient() {
         setMatchMessage("셀카 확인 중...");
 
         const url = await loadSelfieUrlByUid(safeUid);
-
         if (!url) {
           setMatchMessage("셀카를 업로드하면 바로 찾아줄게!");
           return;
         }
 
+        // 🔥 중요: URL만 있으면 file을 못 만들기 때문에 자동매칭은 “다시 업로드” 기반이었음
+        // 그래서 자동매칭은 UX용 메시지만 두고, 사용자가 다시 올리게 유도하는게 가장 안전함.
         setSelfieUrl(url);
-        await runMatching(url);
+        setMatchMessage("이전에 올린 셀카가 있어요! 아래에서 다시 한 번 ‘내 사진 찾기 시작’을 눌러주세요.");
       } catch (e) {
         console.error(e);
-        setMatchMessage("자동 매칭을 시작하지 못했어요. 셀카를 다시 올려줘!");
+        setMatchMessage("자동 확인에 실패했어요. 셀카를 다시 올려줘!");
       }
     };
 
@@ -371,16 +229,17 @@ export default function FindClient() {
       setMatchMessage("");
       setSelfieUrl("");
 
+      // 1) 셀카 Storage 업로드(기록용)
       const ext = file.name.split(".").pop() || "jpg";
       const selfiePath = `events/${safeEventId}/selfies/${safeUid}.${ext}`;
 
       const storageRef2 = ref(storage, selfiePath);
       await uploadBytes(storageRef2, file);
-
       const url = await getDownloadURL(storageRef2);
       setSelfieUrl(url);
 
-      await runMatching(url);
+      // 2) face-server 임베딩 기반 매칭
+      await runMatching(file);
     } catch (e) {
       console.error(e);
       setMatchMessage("셀카 업로드/매칭에 실패했어요. 다시 시도해줘!");
@@ -445,11 +304,11 @@ export default function FindClient() {
           </Link>
           <div style={{ fontSize: 18, fontWeight: 950 }}>내 사진 찾기</div>
           <div style={{ marginLeft: "auto", fontSize: 12, opacity: 0.6 }}>
-            {loadingEventPhotos ? "사진 준비 중…" : eventPhotos.length ? `${eventPhotos.length}장` : ""}
+            {loadingEventPhotos ? "사진 준비 중…" : eventPhotos.length ? `${eventPhotos.length}장(임베딩)` : ""}
           </div>
         </div>
 
-        {/* Upload card (one-page flow) */}
+        {/* Upload card */}
         <div
           style={{
             borderRadius: 22,
@@ -459,17 +318,10 @@ export default function FindClient() {
           }}
         >
           <div style={{ fontSize: 14, opacity: 0.75, marginBottom: 10 }}>
-            셀카를 업로드(또는 촬영)하면 행사 사진에서 내 사진을 찾아줘요.
+            셀카를 업로드하면 (임베딩 기반으로) 내 사진을 찾아줘요.
           </div>
 
-          <div
-            style={{
-              border: "1px solid #222",
-              borderRadius: 18,
-              padding: 14,
-              background: "#070707",
-            }}
-          >
+          <div style={{ border: "1px solid #222", borderRadius: 18, padding: 14, background: "#070707" }}>
             <input
               type="file"
               accept="image/*"
@@ -522,47 +374,6 @@ export default function FindClient() {
 
           <div style={{ marginTop: 10, fontSize: 12, opacity: 0.65 }}>{eventPhotosMsg}</div>
 
-          {/* Progress + Abort */}
-          {matchLoading ? (
-            <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <div style={{ fontSize: 12, opacity: 0.75 }}>
-                진행: {progress.done} / {progress.total}
-              </div>
-
-              <div
-                style={{
-                  flex: "1 1 260px",
-                  height: 6,
-                  borderRadius: 999,
-                  background: "rgba(255,255,255,0.12)",
-                  overflow: "hidden",
-                }}
-              >
-                <div
-                  style={{
-                    height: "100%",
-                    width: `${progress.total ? Math.round((progress.done / progress.total) * 100) : 0}%`,
-                    background: "rgba(255,90,42,0.9)",
-                  }}
-                />
-              </div>
-
-              <button
-                onClick={abortScan}
-                style={{
-                  padding: "8px 10px",
-                  borderRadius: 12,
-                  border: "1px solid rgba(255,255,255,0.18)",
-                  background: "transparent",
-                  color: "#fff",
-                  cursor: "pointer",
-                }}
-              >
-                중단
-              </button>
-            </div>
-          ) : null}
-
           {/* Advanced */}
           <div style={{ marginTop: 14 }}>
             <button
@@ -595,28 +406,22 @@ export default function FindClient() {
                 <div style={{ fontSize: 14, opacity: 0.9 }}>
                   유사도 기준선: <b>{threshold.toFixed(2)}</b>
                 </div>
-                <div style={{ fontSize: 12, opacity: 0.7 }}>(추천: 0.86~0.92)</div>
+                <div style={{ fontSize: 12, opacity: 0.7 }}>(추천: 0.45~0.70)</div>
               </div>
 
               <input
                 type="range"
-                min={0.7}
-                max={0.99}
+                min={0.2}
+                max={0.9}
                 step={0.01}
                 value={threshold}
                 onChange={(e) => setThreshold(Number(e.target.value))}
                 style={{ width: "100%", marginTop: 10 }}
                 disabled={matchLoading}
               />
-              <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
-                기준선을 올리면 “정확도↑, 결과수↓” / 내리면 “결과수↑, 오탐↑”
-              </div>
 
               <div style={{ marginTop: 10, fontSize: 12, opacity: 0.65 }}>
                 UID(자동): <b>{safeUid}</b>
-              </div>
-              <div style={{ marginTop: 6, fontSize: 12, opacity: 0.65 }}>
-                스캔: {scanBatchSize}장씩 / 최대 {scanMax}장
               </div>
             </div>
           ) : null}
@@ -624,62 +429,6 @@ export default function FindClient() {
 
         {/* Status */}
         <div style={{ marginTop: 14, opacity: 0.85 }}>{matchMessage}</div>
-
-        {/* Empty state */}
-        {!matchLoading && matches.length === 0 ? (
-          <div
-            style={{
-              marginTop: 16,
-              borderRadius: 22,
-              border: "1px solid #1f1f1f",
-              background: "#070707",
-              padding: 18,
-              opacity: 0.95,
-            }}
-          >
-            <div style={{ fontSize: 16, fontWeight: 900, marginBottom: 6 }}>아직 결과가 없어요</div>
-            <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 14 }}>
-              셀카를 업로드하면 바로 찾아줄게요. 결과가 없으면 고급설정에서 기준선을 조금 낮춰보세요.
-            </div>
-
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              <button
-                onClick={() => setShowAdvanced(true)}
-                style={{
-                  width: "100%",
-                  padding: 14,
-                  borderRadius: 999,
-                  border: "1px solid rgba(255,255,255,0.22)",
-                  background: "transparent",
-                  color: "#fff",
-                  fontWeight: 900,
-                  cursor: "pointer",
-                  opacity: 0.95,
-                }}
-              >
-                기준선 조절
-              </button>
-
-              <Link
-                href={`/p?eventId=${encodeURIComponent(safeEventId)}`}
-                style={{
-                  width: "100%",
-                  padding: 14,
-                  borderRadius: 999,
-                  border: "1px solid rgba(255,255,255,0.22)",
-                  color: "#fff",
-                  fontWeight: 900,
-                  textDecoration: "none",
-                  display: "block",
-                  textAlign: "center",
-                  opacity: 0.95,
-                }}
-              >
-                전체 사진 보기
-              </Link>
-            </div>
-          </div>
-        ) : null}
 
         {/* Results grid */}
         {matches.length > 0 ? (
@@ -763,7 +512,7 @@ export default function FindClient() {
         ) : null}
       </div>
 
-      {/* ✅ Lightbox (안 잘림) */}
+      {/* Lightbox */}
       {lightboxOpen && active ? (
         <div
           onClick={() => setLightboxOpen(false)}
@@ -790,7 +539,6 @@ export default function FindClient() {
               alignItems: "center",
               justifyContent: "center",
               padding: 12,
-              overflow: "visible",
             }}
           >
             {/* eslint-disable-next-line @next/next/no-img-element */}
