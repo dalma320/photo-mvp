@@ -1,0 +1,9 @@
+// app/admin/ingest/page.tsx
+import IngestClient from "./IngestClient";
+
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+export default function Page() {
+  return <IngestClient />;
+}

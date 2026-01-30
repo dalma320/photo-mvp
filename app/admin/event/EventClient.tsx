@@ -88,6 +88,27 @@ export default function EventClient() {
 
   const log = (t: string) => setMsg(t);
 
+  // ✅ 주최사용 업로드 링크 (행사 고정)
+const uploadUrl = useMemo(() => {
+  if (!eventId) return "";
+  const base =
+    typeof window !== "undefined"
+      ? window.location.origin
+      : "https://photo-mvp.vercel.app";
+  return `${base}/admin/upload?eventId=${encodeURIComponent(eventId)}`;
+}, [eventId]);
+
+const copyUploadUrl = async () => {
+  if (!uploadUrl) return;
+  try {
+    await navigator.clipboard.writeText(uploadUrl);
+    setMsg("업로드 링크 복사 완료 ✅");
+  } catch {
+    setMsg("복사 실패 ❌ 수동으로 복사해줘");
+  }
+};
+
+
   // 바깥 클릭 닫기
   useEffect(() => {
     const onDown = (e: MouseEvent) => {
@@ -103,7 +124,7 @@ export default function EventClient() {
     if (!q) return eventList.slice(0, 30);
     return eventList.filter((id) => id.toLowerCase().includes(q)).slice(0, 30);
   }, [eventList, queryText]);
-
+  
   const pickEvent = (id: string) => {
     const v = normalizeId(id);
     setSelectedId(v);
@@ -139,6 +160,8 @@ export default function EventClient() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fromUrl]);
 
+
+  
   // 2) 이벤트 메타 로드 (없으면 seed)
   useEffect(() => {
     if (!eventId) return;
@@ -366,7 +389,6 @@ export default function EventClient() {
                 outline: "none",
               }}
             />
-
             {openList ? (
               <div
                 style={{
@@ -437,6 +459,21 @@ export default function EventClient() {
           {/* 바로가기 */}
           {eventId ? (
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
+              <button
+                onClick={copyUploadUrl}
+               style={{
+                  padding: "10px 12px",
+                 borderRadius: 999,
+                 border: "1px solid rgba(255,255,255,0.18)",
+                 background: "transparent",
+                 color: "#fff",
+                 fontWeight: 900,
+                 cursor: "pointer",
+               }}
+            >
+               업로드 링크 복사
+            </button>
+
               <Link
                 href={`/e/${encodeURIComponent(eventId)}`}
                 style={{ padding: "10px 12px", borderRadius: 999, border: "1px solid rgba(255,255,255,0.18)", color: "#fff", textDecoration: "none", fontWeight: 900 }}
@@ -491,6 +528,7 @@ export default function EventClient() {
                         style={{ width: "100%", padding: 12, borderRadius: 12, border: "1px solid #222", background: "#000", color: "#fff" }}
                       />
                     </div>
+                    
 
                     <div>
                       <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8 }}>상태</div>
@@ -527,7 +565,6 @@ export default function EventClient() {
                       style={{ width: "100%", padding: 12, borderRadius: 12, border: "1px solid #222", background: "#000", color: "#fff", outline: "none" }}
                     />
                   </div>
-
                   <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
                     <button
                       onClick={saveMeta}
@@ -744,4 +781,5 @@ export default function EventClient() {
       </div>
     </main>
   );
+
 }
